@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Offline public retrieval gate using fictional test fixtures, not a SAP corpus benchmark."""
 import subprocess
 import sys

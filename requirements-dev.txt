@@ -1,2 +1,3 @@
+# Core runtime (including pypdf) plus test tools; no semantic stack.
 -r requirements.txt
 pytest>=8,<10

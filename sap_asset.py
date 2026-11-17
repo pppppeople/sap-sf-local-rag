@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Small asset helpers for SAP SF notes.
 
 This script keeps the "consultant asset" workflow lightweight:
@@ -556,10 +555,6 @@ def query_context_data(question: str) -> dict:
         "context": context,
         "formatted": "\n".join(lines),
     }, private)
-
-
-def query_context(question: str) -> str:
-    return query_context_data(question)["formatted"]
 
 
 def main() -> None:

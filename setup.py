@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SAP SF Assistant — 首次配置脚本
 自动检测操作系统，配置路径，可选写入 Claude Code hook。
@@ -8,6 +7,8 @@ SAP SF Assistant — 首次配置脚本
     python3 setup.py --hook   # 同时写入 Claude Code hook
     python3 setup.py --check  # 仅检查当前环境，不写入任何文件
 """
+
+from __future__ import annotations
 
 import sys
 import platform
@@ -67,7 +68,7 @@ HD  = lambda t: _c("1;36", t)
 def to_posix(path) -> str:
     """Convert Windows absolute path to POSIX (for Claude Code hooks on Windows)."""
     s = str(path).replace("\\", "/")
-    # D:/foo/bar → /d/foo/bar
+    # Convert a drive prefix to the corresponding POSIX drive component.
     if len(s) >= 2 and s[1] == ":":
         s = "/" + s[0].lower() + s[2:]
     return s
@@ -90,15 +91,6 @@ def find_python(is_win: bool = IS_WIN) -> tuple[str | None, str]:
     candidates = ["python3", "python"] if not is_win else ["python", "python3"]
     extra: list[str] = []
     if is_win:
-        # Common non-PATH install locations on Windows
-        for drive in "CDEFGHD":
-            extra += [
-                f"{drive}:\\python\\python.exe",
-                f"{drive}:\\Python312\\python.exe",
-                f"{drive}:\\Python311\\python.exe",
-                f"{drive}:\\Python310\\python.exe",
-                f"{drive}:\\Python39\\python.exe",
-            ]
         home = Path.home()
         extra += [
             str(home / "AppData/Local/Programs/Python/Python312/python.exe"),
@@ -132,7 +124,6 @@ def find_claude(is_win: bool = IS_WIN) -> str | None:
     if not is_win:
         candidates = [
             str(Path.home() / ".npm-global/bin/claude"),
-            "/usr/local/bin/claude",
         ]
     return find_bin("claude", candidates)
 
@@ -144,20 +135,7 @@ def find_nlm(is_win: bool = IS_WIN) -> str | None:
             str(Path.home() / ".local/bin/nlm"),
             str(Path.home() / "anaconda3/envs/ima-mcp/bin/nlm"),
             str(Path.home() / "miniconda3/envs/ima-mcp/bin/nlm"),
-            "/usr/local/bin/nlm",
         ]
-    else:
-        username = Path.home().name
-        for drive in "CDEFG":
-            candidates += [
-                f"{drive}:\\anaconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\miniconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\Users\\{username}\\anaconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\Users\\{username}\\miniconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\{username}\\anaconda\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\{username}\\anaconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-                f"{drive}:\\{username}\\miniconda3\\envs\\ima-mcp\\Scripts\\nlm.exe",
-            ]
     return find_bin("nlm", candidates) or find_bin("nlm.exe", candidates)
 
 
@@ -371,7 +349,7 @@ def main():
 
     # ── 未找到时提示手动补充 ──────────────────────────────────────────────────
     python_exe  = _prompt_missing(python_exe,  "Python",      required=True,
-                                  hint="python3 或完整路径，如 /usr/local/bin/python3",
+                                  hint="python3 或你自行配置的可执行文件路径",
                                   install_url="https://www.python.org/downloads/")
     claude_exe  = _prompt_missing(claude_exe,  "Claude Code", required=False,
                                   hint="claude 或完整路径，如 ~/.npm-global/bin/claude")
@@ -416,6 +394,7 @@ def main():
     pip_cmd = f"{python_exe} -m pip"
     print(f"  下一步：安装依赖")
     print(f"  {pip_cmd} install -r requirements.txt")
+    print(f"  可选语义检索增强：{pip_cmd} install -r requirements-semantic.txt")
     print(f"  然后把 SAP PDF 放入 {docs_dir}/<模块文件夹>，运行 python3 build_index.py 建立索引")
 
 

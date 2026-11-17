@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SAP SuccessFactors Assistant - Interactive Q&A
 BM25 检索 + 多 LLM provider 支持
@@ -21,7 +20,9 @@ import threading
 import time
 import tempfile
 from pathlib import Path
+from functools import wraps
 from typing import Optional
+from lib.result import Result, failure, exception_result, diagnose
 from knowledge import KnowledgeStore, combine_context, extract_docx, official_query
 
 # 压掉 sentence-transformers / urllib3 的版本兼容警告
@@ -257,11 +258,23 @@ def _load_platform_cfg() -> dict:
         return {}
 
 _PCFG = _load_platform_cfg()
+
+def _env_cli_path(variable: str) -> Optional[str]:
+    for value in os.environ.get(variable, "").split(os.pathsep):
+        if value.strip():
+            candidate = Path(value.strip()).expanduser()
+            if candidate.exists():
+                return str(candidate)
+    return None
+
 CLAUDE_BIN = _PCFG.get("claude_bin") or shutil.which("claude") or "claude"
-CODEX_BIN = _PCFG.get("codex_bin") or shutil.which("codex") or "/Applications/Codex.app/Contents/Resources/codex"
+CODEX_BIN = _PCFG.get("codex_bin") or _env_cli_path("SAP_SF_CODEX_PATH") or shutil.which("codex") or "codex"
 
 def _find_nlm() -> str:
-    # 1. PATH lookup
+    # 1. Explicit environment candidates, then PATH lookup
+    configured = _env_cli_path("SAP_SF_NLM_PATH")
+    if configured:
+        return configured
     found = shutil.which("nlm") or shutil.which("nlm.exe")
     if found:
         return found
@@ -271,16 +284,6 @@ def _find_nlm() -> str:
         Path.home() / "anaconda3/envs/ima-mcp/Scripts/nlm.exe",
         Path.home() / "miniconda3/envs/ima-mcp/Scripts/nlm.exe",
     ]
-    # 3. Scan common conda locations on Windows (any drive, with/without username prefix)
-    username = Path.home().name
-    for drive in "CDEFG":
-        candidates += [
-            Path(f"{drive}:/anaconda3/envs/ima-mcp/Scripts/nlm.exe"),
-            Path(f"{drive}:/miniconda3/envs/ima-mcp/Scripts/nlm.exe"),
-            Path(f"{drive}:/{username}/anaconda/envs/ima-mcp/Scripts/nlm.exe"),
-            Path(f"{drive}:/{username}/anaconda3/envs/ima-mcp/Scripts/nlm.exe"),
-            Path(f"{drive}:/{username}/miniconda3/envs/ima-mcp/Scripts/nlm.exe"),
-        ]
     for p in candidates:
         if p.exists():
             return str(p)
@@ -531,38 +534,53 @@ def run_setup():
 
 HISTORY_KEEP = 6  # 保留最近 N 条消息（user+assistant 各算一条）
 
-def call_notebooklm(prompt: str, config: dict) -> str:
+def _provider_boundary(function):
+    """All adapters return Result, including import/setup/subprocess failures."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            result = function(*args, **kwargs)
+            if isinstance(result, Result):
+                return result
+            if not isinstance(result, str):
+                return failure("invalid_response")
+            if not result.strip():
+                return failure("empty_response", True)
+            return Result(True, content=result)
+        except Exception as error:
+            return exception_result(error)
+    return wrapped
+
+
+@_provider_boundary
+def call_notebooklm(prompt: str, config: dict) -> Result:
     notebooks = {**NLM_NOTEBOOKS}
     notebooks.update(config.get("providers", {}).get("notebooklm", {}).get("notebooks", {}))
     question = prompt.split("Question:")[-1].strip() if "Question:" in prompt else prompt
     module = _detect_nlm_module(question)
     notebook_id = notebooks.get(module) or notebooks.get("platform")
     if not notebook_id:
-        return "[NotebookLM] Configure your own module or platform notebook ID first."
+        return failure("configuration_missing")
     module_label = module.replace("_", " ").title()
+    result = subprocess.run(
+        [NLM_BIN, "query", "notebook", notebook_id, question, "--json"],
+        capture_output=True, text=True, timeout=120, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return failure("process_error", True)
     try:
-        result = subprocess.run(
-            [NLM_BIN, "query", "notebook", notebook_id, question, "--json"],
-            capture_output=True, text=True, timeout=120, encoding="utf-8",
-        )
-        raw = result.stdout.strip() or result.stderr.strip()
-        if not raw:
-            return f"[NotebookLM 错误] 无输出（exit {result.returncode}）"
-        data = json.loads(raw)
-        # nlm CLI wraps answer in {"value": {...}} or returns {"answer": ...} directly
-        payload = data.get("value", data)
-        answer = payload.get("answer", "")
-        if not answer:
-            return f"[NotebookLM 错误] 返回内容为空"
-        # 去掉 NotebookLM 的行内引用编号，如 [1]、[1, 2]、[1-3]
-        answer = re.sub(r'\s*\[\d[\d,\s\-]*\]', '', answer)
-        return f"[来源：NotebookLM — {module_label}]\n\n{answer}"
-    except FileNotFoundError:
-        return "[错误] 找不到 nlm 命令，请确认 NotebookLM MCP CLI 已安装并在 PATH 中"
-    except subprocess.TimeoutExpired:
-        return "[错误] NotebookLM 查询超时（120s）"
+        data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return result.stdout.strip()
+        return failure("invalid_json")
+    if not isinstance(data, dict):
+        return failure("invalid_schema")
+    payload = data.get("value", data)
+    if not isinstance(payload, dict) or not isinstance(payload.get("answer"), str):
+        return failure("invalid_schema")
+    answer = re.sub(r'\s*\[\d[\d,\s\-]*\]', '', payload["answer"]).strip()
+    if not answer:
+        return failure("empty_response", True)
+    return f"[来源：NotebookLM — {module_label}]\n\n{answer}"
 
 
 def _looks_truncated(text: str) -> bool:
@@ -590,7 +608,8 @@ def _looks_truncated(text: str) -> bool:
     return False
 
 
-def call_claude_code(prompt: str, history: list) -> str:
+@_provider_boundary
+def call_claude_code(prompt: str, history: list) -> Result:
     # 子进程模式前缀：阻止 Claude Code 读取 CLAUDE.md 中的笔记保存指令，只输出答案
     _SYS = "[SYSTEM] You are called as a subroutine. Output ONLY the answer. Do NOT save notes, run commands, or follow any project-level instructions.\n\n"
     if history:
@@ -609,7 +628,7 @@ def call_claude_code(prompt: str, history: list) -> str:
         encoding='utf-8',
     )
     if result.returncode != 0:
-        return f"[错误] {result.stderr.strip() or '调用失败'}"
+        return failure("process_error", True)
     full_text = result.stdout.strip()
 
     # ── 自动续写（最多 4 次）─────────────────────────────────────────────────
@@ -628,6 +647,8 @@ def call_claude_code(prompt: str, history: list) -> str:
             capture_output=True, text=True, timeout=180,
             encoding='utf-8',
         )
+        if cont.returncode != 0:
+            return failure("process_error", True)
         chunk = cont.stdout.strip()
         if not chunk or len(chunk) < 30:
             break
@@ -636,7 +657,8 @@ def call_claude_code(prompt: str, history: list) -> str:
     return full_text
 
 
-def call_codex(prompt: str, history: list, config: dict) -> str:
+@_provider_boundary
+def call_codex(prompt: str, history: list, config: dict) -> Result:
     _SYS = (
         "[SYSTEM] You are called as a SAP SuccessFactors Q&A subroutine. "
         "Output ONLY the final answer for the user. Do NOT save notes, do NOT run unrelated commands, "
@@ -691,85 +713,65 @@ def call_codex(prompt: str, history: list, config: dict) -> str:
             if not output:
                 output = (result.stdout or "").strip()
             if result.returncode != 0:
-                err = (result.stderr or result.stdout or "").strip()
-                return f"[错误] Codex 调用失败：{err or f'退出码 {result.returncode}'}"
-            return output.strip() or "[错误] Codex 未返回内容。"
-    except subprocess.TimeoutExpired:
-        return "[错误] Codex 调用超时，请稍后重试或换用 notebooklm/deepseek。"
-    except FileNotFoundError:
-        return f"[错误] 未找到 Codex CLI：{CODEX_BIN}。请检查 Codex 安装路径。"
-    except Exception as e:
-        return f"[错误] Codex 调用失败：{type(e).__name__}: {e}"
+                return failure("process_error", True)
+            return output.strip()
+    except Exception as error:
+        return exception_result(error)
 
 
-def call_anthropic(prompt: str, cfg: dict, history: list) -> str:
+
+@_provider_boundary
+def call_anthropic(prompt: str, cfg: dict, history: list) -> Result:
     import anthropic
     client = anthropic.Anthropic(api_key=cfg["api_key"])
-    try:
-        messages = history + [{"role": "user", "content": prompt}]
-        full_text = ""
-        for _ in range(5):  # 最多自动续写 5 次
-            resp = client.messages.create(
-                model=cfg.get("model", "claude-sonnet-4-6"),
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            )
-            full_text += resp.content[0].text
-            if resp.stop_reason != "max_tokens":
-                break
-            messages = messages + [
-                {"role": "assistant", "content": full_text},
-                {"role": "user", "content": "请继续"},
-            ]
-        return full_text
-    except anthropic.AuthenticationError:
-        return "[错误] Anthropic API Key 无效，请运行 python3 ask.py --setup 重新配置。"
-    except anthropic.RateLimitError:
-        return "[错误] Anthropic 请求超限，请稍后再试。"
-    except Exception as e:
-        return f"[错误] 调用失败：{type(e).__name__}: {e}"
+    messages = history + [{"role": "user", "content": prompt}]
+    full_text = ""
+    for _ in range(5):  # 最多自动续写 5 次
+        resp = client.messages.create(
+            model=cfg.get("model", "claude-sonnet-4-6"),
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=messages,
+        )
+        full_text += resp.content[0].text
+        if resp.stop_reason != "max_tokens":
+            break
+        messages = messages + [
+            {"role": "assistant", "content": full_text},
+            {"role": "user", "content": "请继续"},
+        ]
+    return full_text
 
 
-def call_openai_compat(prompt: str, cfg: dict, base_url: str, history: list) -> str:
-    from openai import OpenAI, AuthenticationError, RateLimitError, NotFoundError
+@_provider_boundary
+def call_openai_compat(prompt: str, cfg: dict, base_url: str, history: list) -> Result:
+    from openai import OpenAI
     client = OpenAI(api_key=cfg["api_key"], base_url=base_url)
-    try:
-        messages = ([{"role": "system", "content": SYSTEM_PROMPT}]
-                    + history
-                    + [{"role": "user", "content": prompt}])
-        full_text = ""
-        for _ in range(5):  # 最多自动续写 5 次
-            resp = client.chat.completions.create(
-                model=cfg.get("model", ""),
-                messages=messages,
-                max_tokens=4096,
-            )
-            chunk = resp.choices[0].message.content
-            full_text += chunk
-            if resp.choices[0].finish_reason != "length":
-                break
-            messages = messages + [
-                {"role": "assistant", "content": full_text},
-                {"role": "user", "content": "请继续"},
-            ]
-        return full_text
-    except AuthenticationError:
-        return "[错误] API Key 无效或已过期，请运行 python3 ask.py --setup 重新配置。"
-    except RateLimitError as e:
-        msg = str(e)
-        if "quota" in msg.lower() or "limit: 0" in msg:
-            return "[错误] 当前 API Key 超出用量限制（免费额度已用完或未开通付费）。请检查账号余额或更换 API Key。"
-        return f"[错误] 请求频率超限，请稍后再试。"
-    except NotFoundError:
-        return f"[错误] Model 名称「{cfg.get('model')}」不存在，请运行 python3 ask.py --setup 修改 model 名。"
-    except Exception as e:
-        return f"[错误] 调用失败：{type(e).__name__}: {e}"
+    messages = ([{"role": "system", "content": SYSTEM_PROMPT}]
+                + history
+                + [{"role": "user", "content": prompt}])
+    full_text = ""
+    for _ in range(5):  # 最多自动续写 5 次
+        resp = client.chat.completions.create(
+            model=cfg.get("model", ""),
+            messages=messages,
+            max_tokens=4096,
+        )
+        chunk = resp.choices[0].message.content
+        full_text += chunk
+        if resp.choices[0].finish_reason != "length":
+            break
+        messages = messages + [
+            {"role": "assistant", "content": full_text},
+            {"role": "user", "content": "请继续"},
+        ]
+    return full_text
 
 
-def ask_llm(prompt: str, provider_name: str, config: dict, history: Optional[list] = None) -> str:
+@_provider_boundary
+def ask_llm(prompt: str, provider_name: str, config: dict, history: Optional[list] = None) -> Result:
     history = (history or [])[-HISTORY_KEEP:]
-    cfg = config["providers"].get(provider_name, {})
+    cfg = config.get("providers", {}).get(provider_name, {})
     if provider_name == "codex":
         return call_codex(prompt, history, config)
     if provider_name == "claude-code":
@@ -780,7 +782,7 @@ def ask_llm(prompt: str, provider_name: str, config: dict, history: Optional[lis
         return call_anthropic(prompt, cfg, history)
     if provider_name in ("deepseek", "moonshot", "doubao", "qwen", "openai", "gemini", "minimax"):
         return call_openai_compat(prompt, cfg, PROVIDERS[provider_name]["base_url"], history)
-    return f"[错误] 未知 provider: {provider_name}"
+    return failure("unknown_provider")
 
 
 # ── 检索 ─────────────────────────────────────────────────────────────────────
@@ -1039,6 +1041,25 @@ def _preprocess_markdown(markdown_content: str) -> str:
 
 
 
+def _atomic_write_docx(filepath: Path, writer) -> None:
+    """Validate a completed DOCX in the same filesystem before replacing the live note."""
+    from docx import Document
+    with tempfile.TemporaryDirectory(prefix=".note-", dir=filepath.parent) as scratch:
+        temporary = Path(scratch) / filepath.name
+        writer(temporary)
+        Document(temporary)
+        temporary.replace(filepath)
+
+
+def _answer_content(answer) -> str:
+    # External --save-note text remains supported; model callers pass only ok content.
+    if isinstance(answer, Result):
+        answer = answer.require_content()
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("answer_requires_nonempty_content")
+    return answer
+
+
 def write_claude_note(filename_slug: str, title: str, markdown_content: str,
                       *, record: bool = True, directory: Optional[Path] = None) -> Path:
     """Create (or overwrite) notes/<filename_slug>.docx from Claude-generated markdown.
@@ -1046,6 +1067,7 @@ def write_claude_note(filename_slug: str, title: str, markdown_content: str,
     Uses pandoc for conversion — handles all markdown syntax correctly.
     <!-- screenshot: 描述 --> placeholders are converted to italic text.
     """
+    markdown_content = _answer_content(markdown_content)
     output_dir = directory or NOTES_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / f'{filename_slug}.docx'
@@ -1061,11 +1083,11 @@ def write_claude_note(filename_slug: str, title: str, markdown_content: str,
     extra_args = ['--reference-doc', str(ref_doc)] if ref_doc.exists() else []
 
     try:
-        pypandoc.convert_text(
+        _atomic_write_docx(filepath, lambda temporary: pypandoc.convert_text(
             full_md, 'docx', format='md',
-            outputfile=str(filepath),
+            outputfile=str(temporary),
             extra_args=extra_args,
-        )
+        ))
     except RuntimeError as e:
         msg = str(e)
         if "permission denied" in msg.lower() or "access is denied" in msg.lower():
@@ -1091,7 +1113,7 @@ def _extract_note_text(path: Path) -> str:
 
 
 def _ai_merge_note(existing_text: str, question: str, answer: str,
-                   sources: list, provider_name: str, config: dict) -> str:
+                   sources: list, provider_name: str, config: dict) -> Result:
     """Ask LLM to reorganize and merge existing note with new Q&A."""
     src_str = '、'.join(str(s).split(' / ')[-1] for s in sources) if sources else '无'
     merge_prompt = f"""你是一个 SAP SuccessFactors 配置文档整理专家。
@@ -1126,10 +1148,10 @@ def _save_note_safe(print_fn, *args, **kwargs) -> Optional[Path]:
         path = save_note(*args, **kwargs)
         print_fn(path)
         return path
-    except PermissionError as e:
-        print(f"  {YL}⚠ {e}{RS}")
-    except Exception as e:
-        print(f"  {YL}⚠ 笔记保存失败：{type(e).__name__}（答案已正常显示）{RS}")
+    except Exception as error:
+        # Do not print conversion/model exception messages containing note content.
+        diagnose("note_save", failure(type(error).__name__))
+        print(f"  {YL}⚠ 笔记保存失败，现役笔记保留；诊断见 stderr{RS}")
     return None
 
 
@@ -1149,6 +1171,7 @@ def save_note(question: str, answer: str, sources: list, tokens: list[str],
     from docx import Document
     from docx.shared import Pt
 
+    answer = _answer_content(answer)
     NOTES_DIR.mkdir(exist_ok=True)
     token_set = set(tokens) if tokens else set(
         t.strip('.,?!') for t in question.lower().split() if len(t) > 2
@@ -1172,13 +1195,16 @@ def save_note(question: str, answer: str, sources: list, tokens: list[str],
             existing_text = _extract_note_text(existing)
             merged_md = _ai_merge_note(existing_text, question, answer,
                                        sources, provider_name, config)
+            if not merged_md.ok:
+                diagnose("note_merge", merged_md)
+            merged_md = merged_md.require_content()
             title = existing.stem.replace('-', ' ').title()
             write_claude_note(existing.stem, title, merged_md, record=False)
         else:
             # Fallback: mechanical append
             doc = Document(existing)
             _write_qa_block(doc, question, answer, sources)
-            doc.save(existing)
+            _atomic_write_docx(existing, doc.save)
         return existing
     else:
         slug = _slug_from_tokens(list(token_set))
@@ -1501,6 +1527,11 @@ def run_tui(chunks: list, bm25, initial_provider: str, config: dict) -> None:
                 _cat.set_msg("正在翻阅幻想乡档案")
                 answer = ask_llm(make_prompt(question, context), provider[0], config, history)
                 _cat.stop()
+                if not answer.ok:
+                    diagnose("answer", answer)
+                    print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                    continue
+                answer = answer.require_content()
                 display_answer(answer)
                 print(_sep())
                 kb_sources = list(dict.fromkeys(r["source"] for r in results[:3]))
@@ -1520,6 +1551,11 @@ def run_tui(chunks: list, bm25, initial_provider: str, config: dict) -> None:
                     _cat.set_msg("正在翻阅幻想乡档案")
                     answer = ask_llm(make_web_prompt(question, web_results), provider[0], config, history)
                     _cat.stop()
+                    if not answer.ok:
+                        diagnose("answer", answer)
+                        print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                        continue
+                    answer = answer.require_content()
                     display_answer(answer)
                     print(_sep())
                     print_web_sources(web_results)
@@ -1534,6 +1570,11 @@ def run_tui(chunks: list, bm25, initial_provider: str, config: dict) -> None:
                     _cat.set_msg("正在翻阅幻想乡档案")
                     answer = ask_llm(make_prompt(question, ""), provider[0], config, history)
                     _cat.stop()
+                    if not answer.ok:
+                        diagnose("answer", answer)
+                        print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                        continue
+                    answer = answer.require_content()
                     display_answer(answer)
                     print(_sep())
                     print(f"  {DM}📖 来源：AI 训练知识（未找到本地文档）{RS}")
@@ -1681,6 +1722,11 @@ def main():
         context = combine_context(build_context(results), private)
         if results:
             answer = ask_llm(make_prompt(question, context), provider, config)
+            if not answer.ok:
+                diagnose("answer", answer)
+                print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                sys.exit(1)
+            answer = answer.require_content()
             display_answer(answer)
             print(_sep())
             kb_sources = list(dict.fromkeys(r["source"] for r in results[:3]))
@@ -1695,6 +1741,11 @@ def main():
             web_results = web_search_sap(question)
             if web_results:
                 answer = ask_llm(make_web_prompt(question, web_results), provider, config)
+                if not answer.ok:
+                    diagnose("answer", answer)
+                    print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                    sys.exit(1)
+                answer = answer.require_content()
                 display_answer(answer)
                 print(_sep())
                 print_web_sources(web_results)
@@ -1704,6 +1755,11 @@ def main():
                                     question, answer, web_sources, tokens)
             else:
                 answer = ask_llm(make_prompt(question, ""), provider, config)
+                if not answer.ok:
+                    diagnose("answer", answer)
+                    print(f"  {RD}回答失败（{answer.error}），请检查配置或稍后重试{RS}")
+                    sys.exit(1)
+                answer = answer.require_content()
                 display_answer(answer)
                 print(_sep())
                 print(f"  {YL}⚠ 本地档案无匹配，网络搜索也没命中，暂按 SF 训练知识回答{RS}")

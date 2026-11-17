@@ -24,3 +24,9 @@ notes/*
 data/*
 !data/README.md
 !data/decisions.example.json
+logs/
+keys/
+*.pem
+*.key
+*.p12
+*.pfx

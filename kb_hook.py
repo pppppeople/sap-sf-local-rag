@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SAP SF Knowledge Base Hook
 UserPromptSubmit hook: 检测 SAP 关键词 → 混合检索（BM25 + 向量语义）→ 注入上下文
@@ -73,8 +72,8 @@ def hybrid_search(message: str, chunks: list, bm25, embeddings) -> list:
                 chunks[i] for i in top
                 if combined[i] > 0.3 and chunks[i]["source"] not in EXCLUDED_SOURCES
             ][:TOP_K]
-        except Exception:
-            pass
+        except Exception as error:
+            _diagnose("semantic_search", error)
 
     # BM25 fallback
     top = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:TOP_K * 2]
@@ -84,18 +83,30 @@ def hybrid_search(message: str, chunks: list, bm25, embeddings) -> list:
     ][:TOP_K]
 
 
+def _diagnose(stage: str, error: Exception) -> None:
+    # Exception text can contain prompt/index content; emit only its type.
+    print(f"[SF hook] stage={stage} error={type(error).__name__}", file=sys.stderr)
+
+
 def main():
+    stage = "input"
     try:
         data = json.load(sys.stdin)
+        if not isinstance(data, dict):
+            raise ValueError("invalid hook input")
         message = data.get("message", "") or data.get("prompt", "")
+        if not isinstance(message, str):
+            raise ValueError("invalid hook message")
         if not message or not is_sap_related(message):
             sys.exit(0)
 
         chunks_path = INDEX_DIR / "chunks.json"
         bm25_path = INDEX_DIR / "bm25.pkl"
         if not chunks_path.exists() or not bm25_path.exists():
+            _diagnose("index_load", FileNotFoundError())
             sys.exit(0)
 
+        stage = "index_load"
         with open(chunks_path, encoding="utf-8") as f:
             chunks = json.load(f)
         with open(bm25_path, "rb") as f:
@@ -109,17 +120,20 @@ def main():
             try:
                 import numpy as np
                 embeddings = np.load(str(emb_path))
-            except Exception:
-                pass
+            except Exception as error:
+                _diagnose("embeddings_load", error)
 
+        stage = "private_retrieval"
         notes_dir = Path(os.environ.get("SAP_SF_NOTES_DIR", Path.home() / ".local/share/sap-sf-assistant/notes"))
         private = KnowledgeStore(notes_dir).retrieve(message,
             manifest=Path(__file__).parent / "index/manifest.json")
+        stage = "official_retrieval"
         results = hybrid_search(official_query(message, private), chunks, bm25, embeddings)
 
         if not results:
             sys.exit(0)
 
+        stage = "context_output"
         parts = []
         total = 0
         for r in results:
@@ -139,7 +153,8 @@ def main():
         }
         print(json.dumps(output, ensure_ascii=False))
 
-    except Exception:
+    except Exception as error:
+        _diagnose(stage, error)
         sys.exit(0)
 
 

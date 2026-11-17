@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SF Knowledge Base - Index Builder
 从 SAP_SF_Docs 提取所有 PDF 文本，分块，保存为 BM25 索引
@@ -167,7 +166,7 @@ def _build_vector_index(chunks: list, index_dir: Path) -> None:
     except ImportError:
         print("\n  提示：可安装语义检索增强包，让搜索结果更准确（可选，约需下载 2GB）")
         pip_cmd = "pip" if sys.platform == "win32" else "pip3"
-        print(f"  {pip_cmd} install sentence-transformers")
+        print(f"  {pip_cmd} install -r requirements-semantic.txt")
         return
 
     print("\n少女祈祷中，正在构建语义检索索引（首次运行需下载约 420MB 模型，请耐心等待）...")

@@ -23,6 +23,7 @@ def test_capture_script_is_disabled_without_explicit_configuration():
     import ask
 
     assert ask.SAP_DRAFT_SCRIPT is None
+    assert ask.NLM_NOTEBOOKS == {}
 
 
 def test_default_notes_and_index_paths_do_not_follow_working_directory(tmp_path):
@@ -64,6 +65,47 @@ def test_codex_answer_scratch_is_private_and_cleaned_on_every_exit(tmp_path, mon
     monkeypatch.setattr(ask.subprocess, "run", fake_run)
     result = ask.call_codex("synthetic question", [], {})
 
-    assert result == "synthetic private answer" if outcome == "success" else result.startswith("[错误]")
+    assert result.ok == (outcome == "success")
+    if result.ok:
+        assert result.content == "synthetic private answer"
+    else:
+        assert result.content is None
+        assert result.error == {"failure": "process_error", "timeout": "timeout",
+                                "missing-cli": "command_missing"}[outcome]
     assert captured and not captured[0].parent.exists()
     assert list((notes / "tmp/codex-answers").iterdir()) == []
+
+
+@pytest.mark.parametrize("variable", ["SAP_SF_CODEX_PATH", "SAP_SF_NLM_PATH"])
+def test_cli_environment_candidates_skip_missing_and_preserve_order(tmp_path, monkeypatch, variable):
+    import ask
+
+    first = tmp_path / "first-cli"
+    second = tmp_path / "second-cli"
+    first.touch()
+    second.touch()
+    monkeypatch.setenv(variable, os.pathsep.join(["", str(tmp_path / "missing"),
+                                               str(first), str(second)]))
+    assert ask._env_cli_path(variable) == str(first)
+
+
+@pytest.mark.parametrize("location", ["environment", "path", "home", "unavailable"])
+def test_notebooklm_discovery_precedence_and_portable_fallback(tmp_path, monkeypatch, location):
+    import ask
+
+    monkeypatch.delenv("SAP_SF_NLM_PATH", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    home_cli = tmp_path / ".local/bin/nlm"
+    if location != "unavailable":
+        home_cli.parent.mkdir(parents=True)
+        home_cli.touch()
+    path_cli = tmp_path / "path-cli"
+    monkeypatch.setattr(ask.shutil, "which", lambda command:
+                        str(path_cli) if location in {"environment", "path"} else None)
+    env_cli = tmp_path / "custom-cli"
+    if location == "environment":
+        env_cli.touch()
+        monkeypatch.setenv("SAP_SF_NLM_PATH", str(env_cli))
+
+    assert ask._find_nlm() == {"environment": str(env_cli), "path": str(path_cli),
+                               "home": str(home_cli), "unavailable": "nlm"}[location]
